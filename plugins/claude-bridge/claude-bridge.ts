@@ -117,16 +117,40 @@ function stripClaudeFrontmatter(content: string): { frontmatter: Record<string, 
 export default async function ClaudeBridgePlugin({ directory }: { directory: string }) {
   return {
     config: async (cfg: Record<string, any>) => {
-      // Part 3: Rules — zero-copy via instructions glob (no AGENTS.md generation)
+      // Part 3: Rules — zero-copy via instructions (no AGENTS.md generation)
+      // Project: one recursive glob (verified: `**` matches via the relative branch).
+      // Global: mycoder's instruction loader reduces absolute paths to basename,
+      // which breaks recursive globs on Windows (`**\*.md` matches nothing), so
+      // global rules are bridged as concrete per-file `~/` paths instead.
       try {
-        const rulesDir = path.join(directory, ".claude", "rules")
-        if (existsSync(rulesDir)) {
-          cfg.instructions ??= []
-          const glob = ".claude/rules/*.md"
-          if (!cfg.instructions.includes(glob)) {
-            cfg.instructions.push(glob)
-            console.log("[claude-bridge] rules glob added to instructions (zero-copy)")
+        cfg.instructions ??= []
+        const projectGlob = ".claude/rules/**/*.md"
+        if (existsSync(path.join(directory, ".claude", "rules")) && !cfg.instructions.includes(projectGlob)) {
+          cfg.instructions.push(projectGlob)
+          console.log(`[claude-bridge] rules glob added: ${projectGlob}`)
+        }
+        const globalRulesDir = path.join(os.homedir(), ".claude", "rules")
+        if (existsSync(globalRulesDir)) {
+          // One concrete per-file `~/` path per rule: the instruction loader
+          // resolves absolute paths as basename+dirname and globs that, so
+          // `~/.claude/rules/**/*.md` would match nothing (`**` would be read
+          // as a literal folder name). Per-file paths sidestep the glob.
+          const walk = (dir: string) => {
+            for (const name of readdirSync(dir)) {
+              const full = path.join(dir, name)
+              if (statSync(full).isDirectory()) {
+                walk(full)
+                continue
+              }
+              if (!name.endsWith(".md")) continue
+              const raw = "~/" + path.relative(os.homedir(), full).replaceAll("\\", "/")
+              if (!cfg.instructions.includes(raw)) {
+                cfg.instructions.push(raw)
+                console.log(`[claude-bridge] global rule bridged: ${raw}`)
+              }
+            }
           }
+          walk(globalRulesDir)
         }
       } catch (error) {
         console.log("[claude-bridge] rules bridge failed:", error instanceof Error ? error.message : String(error))
@@ -153,7 +177,7 @@ export default async function ClaudeBridgePlugin({ directory }: { directory: str
                 continue
               }
               if (process.platform === "win32") {
-                execSync(`cmd /c rmdir "${dst}"`, { stdio: "ignore" })
+                execSync(`cmd /c rmdir "${dst}"`, { stdio: "ignore", windowsHide: true })
               } else {
                 rmSync(dst)
               }
@@ -169,7 +193,7 @@ export default async function ClaudeBridgePlugin({ directory }: { directory: str
             if (existsSync(dstFile)) continue
             try {
               if (process.platform === "win32") {
-                execSync(`cmd /c mklink /H "${dstFile}" "${path.join(src, name)}"`, { stdio: "ignore" })
+                execSync(`cmd /c mklink /H "${dstFile}" "${path.join(src, name)}"`, { stdio: "ignore", windowsHide: true })
               } else {
                 execSync(`ln -s "${path.join(src, name)}" "${dstFile}"`, { stdio: "ignore" })
               }
