@@ -17,9 +17,7 @@
 //   bun claude-bridge.ts                    # migrate for current directory
 //   bun claude-bridge.ts <projectPath>      # migrate for a specific project
 
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
-import { execSync } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, realpathSync, lstatSync, rmSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, realpathSync, lstatSync, readlinkSync, linkSync, copyFileSync, rmSync } from "fs"
 import os from "os"
 import path from "path"
 
@@ -46,7 +44,19 @@ function claudeJsonPath(): string {
 }
 
 function normalizePath(p: string): string {
-  return p.replaceAll("\\", "/").replace(/\/$/, "").toLowerCase()
+  const normalized = p.replaceAll("\\", "/").replace(/\/$/, "")
+  // case-insensitive only where the filesystem is (Windows); POSIX is
+  // case-sensitive and two projects may differ by case alone
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+function isLink(p: string): boolean {
+  try {
+    readlinkSync(p)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function convertServer(srv: ClaudeMcpServer): Record<string, unknown> | undefined {
@@ -82,7 +92,7 @@ function readProjectMcpJson(directory: string): Record<string, ClaudeMcpServer> 
   if (!existsSync(p)) return undefined
   try {
     // strip BOM if present (PowerShell utf8 writes include it)
-    return (JSON.parse(readFileSync(p, "utf8").replace(/^\uFEFF/, "") as string) as any).mcpServers
+    return (JSON.parse(readFileSync(p, "utf8").replace(/^\uFEFF/, "")) as any).mcpServers
   } catch {
     return undefined
   }
@@ -102,11 +112,14 @@ function writeJsonSafe(p: string, data: any) {
 }
 
 function stripClaudeFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
-  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
+  // PowerShell-style writers prepend a BOM; without stripping it, the leading
+  // `---` never matches and the whole frontmatter is silently lost.
+  const m = content.replace(/^\uFEFF/, "").match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
   if (!m) return { frontmatter: {}, body: content }
   const frontmatter: Record<string, string> = {}
-  for (const line of m[1].split("\n")) {
-    const kv = line.match(/^([\w-]+):\s*(.*)$/)
+  for (const rawLine of m[1].split("\n")) {
+    const line = rawLine.replace(/\r$/, "")
+    const kv = line.match(/^([\w-]+):\s*(.*?)\s*$/)
     if (kv) frontmatter[kv[1]] = kv[2]
   }
   return { frontmatter, body: m[2] }
@@ -168,38 +181,51 @@ export default async function ClaudeBridgePlugin({ directory }: { directory: str
         for (const [src, dst] of pairs) {
           if (!existsSync(src)) continue
           if (existsSync(dst)) {
-            if (lstatSync(dst).isSymbolicLink()) {
-              // junction/symlink: only touch it when it points at src (our own
-              // previous layout); a foreign link is left alone
+            if (isLink(dst)) {
+              // link: only touch it when it points at src (our own previous
+              // layout); a foreign link is left alone
               try {
                 if (normalizePath(realpathSync(dst)) !== normalizePath(realpathSync(src))) continue
               } catch {
                 continue
               }
-              if (process.platform === "win32") {
-                execSync(`cmd /c rmdir "${dst}"`, { stdio: "ignore", windowsHide: true })
-              } else {
-                rmSync(dst)
-              }
+              rmSync(dst, { recursive: true, force: true })
             } else if (!statSync(dst).isDirectory()) {
               continue
             }
           }
           mkdirSync(dst, { recursive: true })
           let linked = 0
-          for (const name of readdirSync(src)) {
-            if (!name.endsWith(".md")) continue
-            const dstFile = path.join(dst, name)
-            if (existsSync(dstFile)) continue
-            try {
-              if (process.platform === "win32") {
-                execSync(`cmd /c mklink /H "${dstFile}" "${path.join(src, name)}"`, { stdio: "ignore", windowsHide: true })
-              } else {
-                execSync(`ln -s "${path.join(src, name)}" "${dstFile}"`, { stdio: "ignore" })
+          // recursive walk: subdirectory structure is preserved
+          // (e.g. .claude/commands/frontend/test.md -> .mycoder/commands/frontend/test.md)
+          const walkCmds = (dir: string, rel: string) => {
+            for (const name of readdirSync(dir)) {
+              const srcFile = path.join(dir, name)
+              const relPath = rel ? rel + "/" + name : name
+              if (statSync(srcFile).isDirectory()) {
+                walkCmds(srcFile, relPath)
+                continue
+              }
+              if (!name.endsWith(".md")) continue
+              const dstFile = path.join(dst, relPath)
+              if (existsSync(dstFile)) continue
+              mkdirSync(path.dirname(dstFile), { recursive: true })
+              try {
+                // hardlink works on Windows NTFS and POSIX alike; no shell,
+                // no escaping, no injection surface
+                linkSync(srcFile, dstFile)
+              } catch {
+                // OneDrive folders, cross-volume targets and similar setups
+                // make linking fail; fall back to a plain copy
+                copyFileSync(srcFile, dstFile)
+                console.log(
+                  `[claude-bridge] commands: ${relPath} hardlink failed, copied instead (content will NOT stay in sync)`,
+                )
               }
               linked++
-            } catch {}
+            }
           }
+          walkCmds(src, "")
           if (linked > 0) {
             console.log(`[claude-bridge] commands: linked ${linked} file(s) into ${dst}`)
           }
@@ -222,17 +248,39 @@ export default async function ClaudeBridgePlugin({ directory }: { directory: str
         const workspaceKey = Object.keys(claudeProjects).find(
           (k) => normalizePath(k) === normalizePath(directory),
         )
+        // Claude Code disable lists: `disabledMcpServers` (project entry in
+        // ~/.claude.json) disables by name for this project regardless of
+        // scope; `disabledMcpjsonServers` (settings.json / settings.local.json)
+        // gates servers defined in the project `.mcp.json`.
+        const disabled = new Set<string>(
+          workspaceKey ? ((claudeProjects[workspaceKey] as any)?.disabledMcpServers ?? []) : [],
+        )
+        const jsonDisabled = new Set<string>()
+        for (const f of ["settings.json", "settings.local.json"]) {
+          const s = readJsonSafe(path.join(directory, ".claude", f)) as any
+          for (const n of s?.disabledMcpjsonServers ?? []) jsonDisabled.add(n)
+        }
         if (workspaceKey) {
           const local = claudeProjects[workspaceKey]?.mcpServers
           if (local) sources.push(local)
         }
 
         const projectServers = readProjectMcpJson(directory)
-        if (projectServers) sources.push(projectServers)
+        if (projectServers) {
+          for (const name of Object.keys(projectServers)) {
+            if (jsonDisabled.has(name)) delete projectServers[name]
+          }
+          sources.push(projectServers)
+        }
 
         let injected = 0
+        let skippedDisabled = 0
         for (const source of sources) {
           for (const [name, srv] of Object.entries(source)) {
+            if (disabled.has(name)) {
+              skippedDisabled++
+              continue
+            }
             // mycoder.json explicit config wins over bridge-injected servers
             if (cfg.mcp[name]) continue
             const converted = convertServer(srv)
@@ -244,6 +292,9 @@ export default async function ClaudeBridgePlugin({ directory }: { directory: str
 
         if (injected > 0) {
           console.log(`[claude-bridge] injected ${injected} MCP server(s) from Claude Code config`)
+        }
+        if (skippedDisabled > 0) {
+          console.log(`[claude-bridge] skipped ${skippedDisabled} disabled MCP server(s)`)
         }
       } catch (error) {
         // best-effort: bridge failure must not break startup
@@ -258,10 +309,29 @@ export default async function ClaudeBridgePlugin({ directory }: { directory: str
 type ReportRow = { category: string; source: string; action: string; target: string; status: string }
 
 function migrateMcp(projectDir: string, rows: ReportRow[]) {
+  // Count actual additions; skip the config rewrite entirely when nothing
+  // changed so re-runs never reformat untouched mycoder.json files.
+  let added = 0
   const claude = readClaudeConfig()
   if (!claude) {
     rows.push({ category: "MCP", source: "~/.claude.json", action: "找不到", target: "—", status: "⏭️ 略過" })
     return
+  }
+
+  // Claude Code disable lists: project-level disable list applies to every
+  // scope in this project; settings json lists only gate servers defined in
+  // the project `.mcp.json`
+  const claudeProjects = claude.projects ?? {}
+  const workspaceKey = Object.keys(claudeProjects).find(
+    (k) => normalizePath(k) === normalizePath(projectDir),
+  )
+  const disabled = new Set<string>(
+    workspaceKey ? ((claudeProjects[workspaceKey] as any)?.disabledMcpServers ?? []) : [],
+  )
+  const jsonDisabled = new Set<string>()
+  for (const f of ["settings.json", "settings.local.json"]) {
+    const s = readJsonSafe(path.join(projectDir, ".claude", f)) as any
+    for (const n of s?.disabledMcpjsonServers ?? []) jsonDisabled.add(n)
   }
 
   // user scope -> global mycoder.json
@@ -269,6 +339,11 @@ function migrateMcp(projectDir: string, rows: ReportRow[]) {
   const globalCfg = readJsonSafe(globalCfgPath) ?? {}
   globalCfg.mcp ??= {}
   for (const [name, srv] of Object.entries(claude.mcpServers ?? {})) {
+    // a server disabled for this project must not leak into global config
+    if (disabled.has(name)) {
+      rows.push({ category: "MCP", source: name + "(user)", action: "略過", target: "—(此專案已停用)", status: "⏭️ 略過" })
+      continue
+    }
     if (globalCfg.mcp[name]) {
       rows.push({ category: "MCP", source: name + "(user)", action: "跳過", target: "—(已存在)", status: "⏭️ 略過" })
       continue
@@ -276,20 +351,22 @@ function migrateMcp(projectDir: string, rows: ReportRow[]) {
     const converted = convertServer(srv)
     if (!converted) continue
     globalCfg.mcp[name] = converted
+    added++
     rows.push({ category: "MCP", source: name + "(user scope)", action: "轉換寫入", target: "~/.mycoder/mycoder.json", status: "✅ 完成" })
   }
-  writeJsonSafe(globalCfgPath, globalCfg)
+  if (added > 0) writeJsonSafe(globalCfgPath, globalCfg)
 
   // local scope (workspace-matched) -> project mycoder.json
-  const claudeProjects = claude.projects ?? {}
-  const workspaceKey = Object.keys(claudeProjects).find(
-    (k) => normalizePath(k) === normalizePath(projectDir),
-  )
+  let projectAdded = 0
   if (workspaceKey) {
     const projectCfgPath = path.join(projectDir, ".mycoder", "mycoder.json")
     const projectCfg = readJsonSafe(projectCfgPath) ?? {}
     projectCfg.mcp ??= {}
     for (const [name, srv] of Object.entries(claudeProjects[workspaceKey]?.mcpServers ?? {})) {
+      if (disabled.has(name)) {
+        rows.push({ category: "MCP", source: name + "(local)", action: "略過", target: "—(Claude 側已停用)", status: "⏭️ 略過" })
+        continue
+      }
       if (projectCfg.mcp[name]) {
         rows.push({ category: "MCP", source: name + "(local)", action: "跳過", target: "—(已存在)", status: "⏭️ 略過" })
         continue
@@ -297,19 +374,23 @@ function migrateMcp(projectDir: string, rows: ReportRow[]) {
       const converted = convertServer(srv)
       if (!converted) continue
       projectCfg.mcp[name] = converted
+      projectAdded++
       rows.push({ category: "MCP", source: name + "(local scope)", action: "轉換寫入", target: ".mycoder/mycoder.json", status: "✅ 完成" })
     }
-    writeJsonSafe(projectCfgPath, projectCfg)
+    if (projectAdded > 0) writeJsonSafe(projectCfgPath, projectCfg)
   }
 
   // project scope (.mcp.json) -> project mycoder.json
-  const mcpJsonPath = path.join(projectDir, ".mcp.json")
   const projectServers = readProjectMcpJson(projectDir)
   if (projectServers) {
     const projectCfgPath = path.join(projectDir, ".mycoder", "mycoder.json")
     const projectCfg = readJsonSafe(projectCfgPath) ?? {}
     projectCfg.mcp ??= {}
     for (const [name, srv] of Object.entries(projectServers)) {
+      if (disabled.has(name) || jsonDisabled.has(name)) {
+        rows.push({ category: "MCP", source: name + "(project)", action: "略過", target: "—(Claude 側已停用)", status: "⏭️ 略過" })
+        continue
+      }
       if (projectCfg.mcp[name]) {
         rows.push({ category: "MCP", source: name + "(project)", action: "跳過", target: "—(已存在)", status: "⏭️ 略過" })
         continue
@@ -317,9 +398,10 @@ function migrateMcp(projectDir: string, rows: ReportRow[]) {
       const converted = convertServer(srv)
       if (!converted) continue
       projectCfg.mcp[name] = converted
+      projectAdded++
       rows.push({ category: "MCP", source: name + "(project scope)", action: "轉換寫入", target: ".mycoder/mycoder.json", status: "✅ 完成" })
     }
-    writeJsonSafe(projectCfgPath, projectCfg)
+    if (projectAdded > 0) writeJsonSafe(projectCfgPath, projectCfg)
   }
 }
 
@@ -333,8 +415,18 @@ function checkSkills(projectDir: string, rows: ReportRow[]) {
     for (const name of readdirSync(dir)) {
       const skillMd = path.join(dir, name, "SKILL.md")
       if (!existsSync(skillMd)) continue
-      const { frontmatter } = stripClaudeFrontmatter(readFileSync(skillMd, "utf8"))
-      if (!frontmatter.description) {
+      let description: string | undefined
+      try {
+        description = stripClaudeFrontmatter(readFileSync(skillMd, "utf8")).frontmatter.description
+      } catch (error) {
+        rows.push({ category: "Skill", source: name, action: "讀取失敗", target: "—", status: "⚠️ 需處理" })
+        console.log(
+          `[claude-bridge] skills: failed to read ${skillMd}:`,
+          error instanceof Error ? error.message : String(error),
+        )
+        continue
+      }
+      if (!description) {
         rows.push({ category: "Skill", source: name, action: "格式問題", target: "—(缺 description)", status: "⚠️ 需處理" })
       } else {
         rows.push({ category: "Skill", source: name, action: "無需遷移", target: "自動載入", status: "✅ 確認可用" })
@@ -354,7 +446,12 @@ function checkSkills(projectDir: string, rows: ReportRow[]) {
         for (const name of pending) {
           rows.push({ category: "Skill", source: name + "(雲端)", action: "待同步", target: "—(pendingClaims 未下載)", status: "⚠️ 需處理" })
         }
-      } catch {}
+      } catch (error) {
+        console.log(
+          `[claude-bridge] skills: failed to read cloud-sync manifest ${manifest}:`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
     }
   }
 }
@@ -376,7 +473,11 @@ function migrateRulesAndImports(projectDir: string, rows: ReportRow[]) {
     const raw = readFileSync(claudeMdPath, "utf8")
     const lines = raw.split("\n")
     const kept = lines.filter((line) => {
-      if (line.trimStart().startsWith("@")) {
+      // Claude imports are a lone @token containing a path character
+      // (e.g. `@~/rules/x.md`, `@src/index.ts`). A bare `@mention` or a
+      // line that merely starts with `@` must survive.
+      const t = line.trimStart()
+      if (/^@[^\s]+$/.test(t) && /[~./\\]/.test(t)) {
         importCount++
         return false
       }
@@ -423,8 +524,20 @@ function migrateRulesAndImports(projectDir: string, rows: ReportRow[]) {
   }
 
   if (existsSync(agentsMdPath)) {
-    writeFileSync(agentsMdPath + ".generated", content, "utf8")
-    rows.push({ category: "AGENTS.md", source: "已存在", action: "寫入 .generated 檔(確認後覆蓋)", target: agentsMdPath + ".generated", status: "⚠️ 需確認" })
+    if (readFileSync(agentsMdPath, "utf8") === content) {
+      rows.push({ category: "AGENTS.md", source: "已存在(內容相同)", action: "跳過", target: "—(已遷移)", status: "⏭️ 略過" })
+    } else {
+      // never silently overwrite a previous .generated the user may have edited
+      const generatedPath = agentsMdPath + ".generated"
+      const finalPath =
+        existsSync(generatedPath) && readFileSync(generatedPath, "utf8") !== content
+          ? `${generatedPath}.${new Date().toISOString().replace(/[:.]/g, "-")}`
+          : generatedPath
+      writeFileSync(finalPath, content, "utf8")
+      rows.push({ category: "AGENTS.md", source: "已存在", action: "寫入 .generated 檔(確認後覆蓋)", target: finalPath, status: "⚠️ 需確認" })
+    }
+  } else if (content.trim() === "") {
+    rows.push({ category: "AGENTS.md", source: "—", action: "無內容", target: "—(不生成空檔)", status: "⏭️ 略過" })
   } else {
     writeFileSync(agentsMdPath, content, "utf8")
     rows.push({ category: "AGENTS.md", source: "CLAUDE.md + rules", action: "生成", target: agentsMdPath, status: "✅ 完成" })
@@ -433,7 +546,6 @@ function migrateRulesAndImports(projectDir: string, rows: ReportRow[]) {
 
 function migrateCommands(projectDir: string, rows: ReportRow[]) {
   const mycoderCmdDir = path.join(projectDir, ".mycoder", "commands")
-  mkdirSync(mycoderCmdDir, { recursive: true })
 
   const sources = [
     ["專案", path.join(projectDir, ".claude", "commands"), mycoderCmdDir],
@@ -443,16 +555,34 @@ function migrateCommands(projectDir: string, rows: ReportRow[]) {
   for (const [source, cmdDir, targetDir] of sources) {
     if (!existsSync(cmdDir)) continue
     mkdirSync(targetDir, { recursive: true })
-    for (const name of readdirSync(cmdDir)) {
-      if (!name.endsWith(".md")) continue
-      const { frontmatter, body } = stripClaudeFrontmatter(readFileSync(path.join(cmdDir, name), "utf8"))
-      const kept = Object.entries(frontmatter)
-        .filter(([k]) => ["description", "model"].includes(k))
-        .map(([k, v]) => `${k}: ${v}`)
-      const out = ["---", ...kept, "---", "", body].join("\n")
-      writeFileSync(path.join(targetDir, name), out, "utf8")
-      rows.push({ category: "Command", source: name + `(${source})`, action: "複製+剝 frontmatter", target: targetDir, status: "✅ 完成" })
+    // recursive walk: subdirectory structure is preserved
+    const walkCmds = (dir: string, rel: string) => {
+      for (const name of readdirSync(dir)) {
+        const srcFile = path.join(dir, name)
+        const relPath = rel ? rel + "/" + name : name
+        if (statSync(srcFile).isDirectory()) {
+          walkCmds(srcFile, relPath)
+          continue
+        }
+        if (!name.endsWith(".md")) continue
+        const dstFile = path.join(targetDir, relPath)
+        if (existsSync(dstFile)) {
+          // mycoder-native (or previously migrated) files win — same rule as
+          // the plugin mode, so re-runs never clobber existing commands.
+          rows.push({ category: "Command", source: relPath + `(${source})`, action: "跳過", target: "—(已存在)", status: "⏭️ 略過" })
+          continue
+        }
+        mkdirSync(path.dirname(dstFile), { recursive: true })
+        const { frontmatter, body } = stripClaudeFrontmatter(readFileSync(srcFile, "utf8"))
+        const kept = Object.entries(frontmatter)
+          .filter(([k]) => ["description", "model"].includes(k))
+          .map(([k, v]) => `${k}: ${v}`)
+        const out = ["---", ...kept, "---", "", body].join("\n")
+        writeFileSync(dstFile, out, "utf8")
+        rows.push({ category: "Command", source: relPath + `(${source})`, action: "複製+剝 frontmatter", target: dstFile, status: "✅ 完成" })
+      }
     }
+    walkCmds(cmdDir, "")
   }
 }
 
