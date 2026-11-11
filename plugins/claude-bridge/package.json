@@ -1,0 +1,24 @@
+{
+  "name": "@ocis/claude-bridge",
+  "version": "1.0.0",
+  "description": "Zero-copy MyCoder plugin that bridges Claude Code configuration (MCP servers, rules, commands) at startup",
+  "main": "./claude-bridge.ts",
+  "files": [
+    "claude-bridge.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "mycoder",
+    "claude-code",
+    "migration",
+    "plugin",
+    "mcp"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.18"
+  }
+}
